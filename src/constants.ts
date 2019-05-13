@@ -1,0 +1,9 @@
+export enum FileType {
+  SOCKET           = 0o0140000,
+  SYMBOLIC_LINK    = 0o0120000,
+  REGULAR_FILE     = 0o0100000,
+  BLOCK_DEVICE     = 0o0060000,
+  DIRECTORY        = 0o0040000,
+  CHARACTER_DEVICE = 0o0020000,
+  FIFO             = 0o0010000
+}
