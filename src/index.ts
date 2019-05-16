@@ -2,8 +2,9 @@ import * as fuse from 'fuse-bindings';
 import { Path } from 'fuse-bindings';
 import { promisify } from 'util';
 import pathToRegexp, { Key } from 'path-to-regexp';
-import { Matcher, Route, FuseHandler, ReadDirResponse, FuseHandlerRequest, Operation, MatcherFunction, PathParameters, FileAttributeCache } from './types';
+import { Matcher, Route, FuseHandler, ReadDirResponse, FuseHandlerRequest, Operation, MatcherFunction, PathParameters, FileAttributeCache, ReadResponse, OpenFiles, SimpleResponse, FuseHandlerResponse } from './types';
 import { readDirResponse } from './FuseResponse';
+import { release } from 'os';
 
 export * from 'fuse-bindings';
 export * from './constants';
@@ -14,16 +15,25 @@ export default function createApp() {
 }
 
 const mountPaths: Set<string> = new Set();
+let fdCounter = 0;
 
 class FuseExpress {
   private handlers: Matcher[] = [];
   private fileAttrCache: FileAttributeCache = new Map();
+  private openFiles: OpenFiles = {};
 
   public ls(route: Route, handler: FuseHandler<ReadDirResponse>) {
     this.handlers.push({
       matches: simpleMatcher(route, 'readdir'),
       handler
     })
+  }
+
+  public read(route: Route, handler: FuseHandler<ReadResponse>) {
+    this.handlers.push({
+      matches: simpleMatcher(route, 'read'),
+      handler
+    });
   }
 
   public async mount(mountPath: Path): Promise<void> {
@@ -35,22 +45,9 @@ class FuseExpress {
     return {
       readdir: (path, callback) => {
         console.log("readdir", path)
-        const operation = "readdir";
-        const matchingHandlers = this.handlers.filter(h => h.matches(path, operation));
-        if (matchingHandlers.length === 0) {
-          console.log("shortcut");
-          callback(0, [".", ".."])
-          return;
-        }
-        const request: FuseHandlerRequest = { operation, path };
+
         const response = readDirResponse(path, this.fileAttrCache, callback);
-
-        let nextHandler = () => { callback(0, [".", ".."]) };
-        forEachRight(matchingHandlers, handler => {
-          nextHandler = () => handler.handler(request, response, nextHandler);
-        });
-
-        nextHandler();
+        this.callHandlers("readdir", path, response, () => callback(0, [".", ".."]))
       },
       getattr: (path, callback) => {
         console.log("getattr", path);
@@ -67,16 +64,85 @@ class FuseExpress {
           })
         }
 
-        const cached = this.fileAttrCache.get(path);
+        let cached = this.fileAttrCache.get(path);
         if (cached) {
           return callback(0, cached);
         }
 
         return callback(fuse.ENOENT);
+      },
+
+      open: (path, flags, cb) => {
+        console.log("open", path, flags)
+        const operation = "read";
+        const matchingHandlers = this.handlers.filter(h => h.matches(path, operation));
+        if (matchingHandlers.length > 0) {
+          cb(0, fdCounter++);
+        } else {
+          cb(fuse.ENOENT);
+        }
+      },
+
+      read: async (path, fd, buffer, length, position, cb) => {
+        console.log("read", path, fd, length, position)
+        let responseBuffer = this.openFiles[fd];
+        if (!responseBuffer) {
+          const response = await this.simpleResponse<ReadResponse>("read", path, () => cb(fuse.ENOENT));
+          if (!response) {
+            return cb(fuse.ENOENT);
+          }
+          if (response.status < 0) {
+            return cb(response.status);
+          }
+          responseBuffer = Buffer.from(response.result);
+          this.openFiles[fd] = responseBuffer;
+        }
+        const bytesWritten = responseBuffer.copy(buffer, 0, position, position + length);
+        cb(bytesWritten);
+      },
+
+      release: (path, fd, cb) => {
+        console.log("release", path, fd)
+        delete this.openFiles[fd];
+        cb(0);
       }
     }
   }
+
+  private simpleResponse<T>(operation: Operation, path: Path, fallback: () => any): Promise<SimpleResponse<T> | undefined> {
+    return new Promise((resolve, reject) => {
+      let statusResponse = 0;
+      const response: FuseHandlerResponse<T> = {
+        status(nr) {
+          statusResponse = nr;
+          return response;
+        },
+        send(result) {
+          resolve({
+            status: statusResponse,
+            result
+          });
+        }
+      };
+      return this.callHandlers(operation, path, response, fallback);
+    });
+  }
+
+  private callHandlers<T>(operation: Operation, path: Path, response: FuseHandlerResponse<T>, fallback: () => any): void {
+    let nextHandler = fallback;
+    forEachRight(this.handlers, handler => {
+      const params = handler.matches(path, operation);
+      if (params) {
+        const request: FuseHandlerRequest = { operation, path, params };
+        nextHandler = () => handler.handler(request, response, nextHandler);
+      }
+    });
+
+    nextHandler();
+  }
 }
+
+
 
 function simpleMatcher(route: Route, operation: Operation): MatcherFunction {
   const keys: Key[] = [];
@@ -96,7 +162,7 @@ function simpleMatcher(route: Route, operation: Operation): MatcherFunction {
 function createPathParameters(keys: Key[], result: RegExpExecArray): PathParameters {
   let params: any = {};
   for (let i = 1; i < result.length; i++) {
-    params[keys[i-1].name] = result[i];
+    params[keys[i - 1].name] = result[i];
   }
   return params;
 }
